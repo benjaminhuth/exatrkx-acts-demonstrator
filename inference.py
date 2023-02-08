@@ -26,21 +26,23 @@ logger = acts.logging.getLogger("main")
 #########################
 
 parser = argparse.ArgumentParser(description='Exa.TrkX data generation/reconstruction script')
-parser.add_argument('events', help="how many events to run", type=int)
 parser.add_argument('models', help="where the models are stored", type=str)
-parser.add_argument('digi', help="digitization mode", type=str, choices=['truth', 'smear'])
-parser.add_argument('--output', '-o', help="where to store output data", type=str, default="output")
+parser.add_argument('--output', '-o', help="where to store output data (defaults to input if empty)", type=str, default="")
+parser.add_argument('--input', '-i', help="where to get data from", type=str, default="output")
 parser.add_argument('--embdim', '-e', help="Hyperparameter embedding dim", type=int, default=8)
 parser.add_argument('--verbose', help="Make ExaTrkX algorithm verbose", action="store_true")
 args = vars(parser.parse_args())
 
-assert args['events'] > 0
+args['output'] = args['input'] if len(args["output"]) == 0 else args["output"]
+
+inputDir = Path(args['input'])
+assert (inputDir / "csv").exists()
 
 outputDir = Path(args['output'])
-(outputDir / "train_all").mkdir(exist_ok=True, parents=True)
+outputDir.mkdir(exist_ok=True, parents=True)
+
 
 modelDir = Path(args['models'])
-
 assert (modelDir / "embed.pt").exists()
 assert (modelDir / "filter.pt").exists()
 assert (modelDir / "gnn.pt").exists()
@@ -62,97 +64,32 @@ detector, trackingGeometry, decorators = getOpenDataDetector(oddDir, mdecorator=
 geoSelectionExaTrkX = baseDir / "detector/odd-geo-selection-whole-detector.json"
 assert geoSelectionExaTrkX.exists()
 
-if args['digi'] == 'smear':
-    digiConfigFile = baseDir / "detector/odd-digi-smearing-config.json"
-elif args['digi'] == 'truth':
-    digiConfigFile = baseDir / "detector/odd-digi-true-config.json"
-assert digiConfigFile.exists()
 
-
-#####################
-# Prepare sequencer #
-#####################
+###########################
+# Prepare & run sequencer #
+###########################
 
 field = acts.ConstantBField(acts.Vector3(0, 0, 2 * u.T))
 
-rnd = acts.examples.RandomNumbers(seed=42)
-
 s = acts.examples.Sequencer(
-    events=args['events'],
     numThreads=1,
     outputDir=str(outputDir),
 )
 
-
-#############################
-# Simulation & Digitization #
-#############################
-
-s = addPythia8(
-    s,
-    rnd=rnd,
-    outputDirCsv=str(outputDir/"train_all"),
-    hardProcess=["HardQCD:all = on"],
-    #hardProcess=["Top:qqbar2ttbar=on"],
-)
-
-particleSelection = ParticleSelectorConfig(
-    rho=(0.0, 2.0*u.mm),
-    pt=(500*u.MeV, 20*u.GeV),
-    absEta=(None, 3)
-)
-
-addFatras(
-    s,
-    trackingGeometry,
-    field,
-    rnd=rnd,
-    preselectParticles=particleSelection,
-)
-
-s = addDigitization(
-    s,
-    trackingGeometry,
-    field,
-    digiConfigFile=digiConfigFile,
-    outputDirRoot=None,
-    outputDirCsv=str(outputDir / "train_all"),
-    rnd=rnd,
-    logLevel=acts.logging.INFO,
-)
-
-s.addWriter(
-    acts.examples.CsvSimHitWriter(
+s.addReader(
+    acts.examples.CsvMeasurementReader(
         level=acts.logging.INFO,
-        inputSimHits="simhits",
-        outputDir=str(outputDir / "train_all"),
-        outputStem="truth",
+        outputSourceLinks="sourcelinks",
+        outputMeasurements="measurements",
+        outputMeasurementSimHitsMap="measurement_simhit_map",
+        inputDir=str(inputDir/"csv")
     )
 )
 
-s.addWriter(
-    acts.examples.CsvMeasurementWriter(
-        level=acts.logging.INFO,
-        inputMeasurements="measurements",
-        inputClusters="clusters",
-        inputSimHits="simhits",
-        inputMeasurementSimHitsMap="measurement_simhits_map",
-        outputDir=str(outputDir / "train_all"),
-    )
-)
 
-s.addWriter(
-    acts.examples.CsvTrackingGeometryWriter(
-        level=acts.logging.INFO,
-        trackingGeometry=trackingGeometry,
-        outputDir=str(outputDir),
-        writePerEvent=False,
-    )
-)
-
-#########################
-# ExaTrkX Track Finding #
-#########################
+#################
+# Track finding #
+#################
 
 s.addAlgorithm(
     acts.examples.SpacePointMaker(
@@ -193,13 +130,56 @@ s.addAlgorithm(
     )
 )
 
-s.addWriter(
-    acts.examples.TrackFinderPerformanceWriter(
-        level=acts.logging.INFO,
+# FIXME currently not possible due to missing measurement_particles_map reader/writer
+# s.addWriter(
+#     acts.examples.TrackFinderPerformanceWriter(
+#         level=acts.logging.INFO,
+#         inputProtoTracks="exatrkx_prototracks",
+#         inputParticles="particles_initial",
+#         inputMeasurementParticlesMap="measurement_particles_map",
+#         filePath=str(outputDir / "track_finding_performance_exatrkx.root"),
+#     )
+# )
+
+
+#################
+# Track fitting #
+#################
+
+s.addAlgorithm(
+    acts.examples.TrackParamsEstimationAlgorithm(
+        level=acts.logging.FATAL,
+        inputSpacePoints=["exatrkx_spacepoints"],
         inputProtoTracks="exatrkx_prototracks",
-        inputParticles="particles_initial",
-        inputMeasurementParticlesMap="measurement_particles_map",
-        filePath=str(outputDir / "track_finding_performance_exatrkx.root"),
+        inputSourceLinks="sourcelinks",
+        outputProtoTracks="exatrkx_estimated_prototracks",
+        outputTrackParameters="exatrkx_estimated_parameters",
+        trackingGeometry=trackingGeometry,
+        magneticField=field,
+    )
+)
+
+kalmanOptions = {
+    "multipleScattering": True,
+    "energyLoss": True,
+    "reverseFilteringMomThreshold": 0.0,
+    "freeToBoundCorrection": acts.examples.FreeToBoundCorrection(False),
+}
+
+s.addAlgorithm(
+    acts.examples.TrackFittingAlgorithm(
+        level=acts.logging.INFO,
+        inputMeasurements="measurements",
+        inputSourceLinks="sourcelinks",
+        inputProtoTracks="exatrkx_estimated_prototracks",
+        inputInitialTrackParameters="exatrkx_estimated_parameters",
+        outputTrajectories="exatrkx_kalman_trajectories",
+        directNavigation=False,
+        pickTrack=-1,
+        trackingGeometry=trackingGeometry,
+        fit=acts.examples.makeKalmanFitterFunction(
+            trackingGeometry, field, **kalmanOptions
+        ),
     )
 )
 

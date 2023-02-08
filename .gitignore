@@ -1,4 +1,4 @@
-run_inference.sh
+run_*.sh
 output*
 
 # Byte-compiled / optimized / DLL files
