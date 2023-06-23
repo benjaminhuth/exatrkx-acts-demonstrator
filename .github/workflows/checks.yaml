@@ -1,0 +1,49 @@
+Name: Checks
+
+on:
+  schedule:
+    - cron: '0 3 * * 0,2,4'
+
+jobs:
+  build_acts_main:
+    runs-on: ubuntu-latest
+    container: ghcr.io/acts-project/ubuntu2004_exatrkx:v41
+
+    steps:
+      - name: Install git lfs
+        run: apt-get update && apt-get install -y git-lfs
+
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+          lfs: true
+
+      - name: Clone acts
+        run: git clone --recursive https://github.com/acts-project/acts
+
+      - name: Configure acts
+        run: >
+          cmake -B build -S acts
+          -D CMAKE_BUILD_TYPE=Release
+          -D ACTS_BUILD_ODD=ON
+          -D ACTS_BUILD_EXAMPLES_PYTHON_BINDINGS=ON
+          -D ACTS_BUILD_PLUGIN_EXATRKX=ON
+          -D ACTS_BUILD_EXAMPLES_EXATRKX=ON
+          -D ACTS_EXATRKX_ENABLE_TORCH=ON
+
+      - name: Build acts
+        run: cmake --build build
+
+  test_demonstrator:
+    runs-on: ubuntu-latest
+    container: ghcr.io/acts-project/ubuntu2004_exatrkx:v41
+
+    steps:
+      - name: Setup environment
+        run: source build/python/setup.sh
+
+      - name: Run inference
+        run: python3 inference.py 3 models/true_hits truth -o output
+
+      - name: Run evaluation
+        run: python3 evaluation.py output
